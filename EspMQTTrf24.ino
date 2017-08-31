@@ -29,21 +29,20 @@
 
 // Update these with values suitable for your network.
 
-#define mySSID "Charlie2";
-#define myPASS "Stach=fu1";
+#define useCredentialsFile
+#ifdef useCredentialsFile
+#include "credentials.h"
+#else
+mySSID = "    ";
+myPASSWORD = "   ";
+#endif
 
-#define DEFAULT_ACTIVATION 600    // 10h from now we activate (in case radio is down and can't program)
-#define DEFAULT_DURATION   10   // max 2h of activation time by default
-//#define HW_BATT            A3   // analog input
-//#define HW_BUZZ            4    // digital output/
-//#define HW_TEMP            A0   // analog input
-//#define HW_WATE            8    // digital output
-//#define HW_RELAY1          9    // d output
-//#define HW_RELAY2          5    // digital output
 #define MOD                "esp1/"
 #define CAT                "feeds/"
 #define T_SWITCH1          "switch1"
 #define T_SWITCH2          "switch2"
+#define T_SWITCH3          "switch3"
+#define T_SWITCH4          "switch4"
 #define T_SCHEDULE1        "schedule1"
 #define T_SCHEDULE2        "schedule2"
 #define T_DURATION1        "duration1"
@@ -52,13 +51,12 @@
 #define T_COMMAND          "provideStatus"
 #define T_CURSTATUS        "currentStatus"
 
-/*WiFiClient espClient;
-PubSubClient client(espClient);*/
-String g_nwSSID = "HNet", g_nwPASS = ".ht2727rc.PRO!", g_nwMQTT = "192.168.8.15";
-long lastMsg = 0;
-char msg[50];
-int value = 0;
-
+// 
+// SW Logic and firmware definitions
+// 
+#define THIS_NODE_ID 3                  // master is 0, unoR3 debugger is 1, promicro_arrosoir is 2, etc
+#define DEFAULT_ACTIVATION 600          // 10h from now we activate (in case radio is down and can't program)
+#define DEFAULT_DURATION 10             // max 10s of activation time by default
 
 /**
  * exchange data via radio more efficiently with data structures.
@@ -73,13 +71,27 @@ struct relayctl {
   unsigned long sched2 = DEFAULT_ACTIVATION;     // schedule in minutes for the relay output nbr2   4 bytes
   unsigned int  maxdur1 = DEFAULT_DURATION;      // max duration nbr1 is ON                         2 bytes
   unsigned int  maxdur2 = DEFAULT_DURATION;      // max duration nbr2 is ON                         2 bytes
+  unsigned long sched3 = DEFAULT_ACTIVATION;     // schedule in minutes for the relay output nbr1   4 bytes
+  unsigned long sched4 = DEFAULT_ACTIVATION;     // schedule in minutes for the relay output nbr2   4 bytes
+  unsigned int  maxdur3 = DEFAULT_DURATION;      // max duration nbr1 is ON                         2 bytes
+  unsigned int  maxdur4 = DEFAULT_DURATION;      // max duration nbr2 is ON                         2 bytes
   unsigned int  temp_thres = 999;                // temperature at which the syatem is operational  4 bytes
   float         temp_now   = 20;                 // current temperature read on the sensor          4 bytes
   short         battery    =  0;                 // current temperature read on the sensor          2 bytes
   bool          state1 = false;                  // state of relay output 1                         1 byte
   bool          state2 = false;                  // "" 2                                            1 byte
+  bool          state3 = false;                  // state of relay output 1                         1 byte
+  bool          state4 = false;                  // "" 2                                            1 byte
   bool          waterlow = false;                // indicates whether water is low                  1 byte
+  byte          nodeid = 3;           // nodeid is the identifier of the slave           1 byte
 } myData;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+String g_nwSSID = "", g_nwPASS = "", g_nwMQTT = "192.168.8.1";
+long lastMsg = 0;
+char msg[50];
+int value = 0;
 
 
 bool loadConfig() {
@@ -114,6 +126,9 @@ bool loadConfig() {
   const char* nwSSID = json["ssid"];
   const char* nwPASS = json["pass"];
   const char* nwMQTT = json["mqtt"];
+  /*Serial.println((nwSSID));  
+  Serial.println((nwPASS));
+  Serial.println((nwMQTT));*/
 
   // Real world application would store these values in some variables for
   // later use.
@@ -121,32 +136,33 @@ bool loadConfig() {
   g_nwSSID = String(nwSSID);
   g_nwPASS = String(nwPASS);
   g_nwMQTT = String(nwMQTT);
-/*
+
   Serial.println(("["+g_nwSSID+"]"));  
   Serial.println(("["+g_nwPASS+"]"));
-  Serial.println(("["+g_nwMQTT+"]"));*/
+  Serial.println(("["+g_nwMQTT+"]"));
   if (g_nwSSID.length() < 4 || g_nwPASS.length() < 6)
   {
     Serial.println("SSID or PSK were too short, defaulting to hard-coded nw.");
-    
+    g_nwSSID = mySSID;
+    g_nwPASS = myPASSWORD;
   }
   return true;
 }
 
 bool saveConfig() {
   
-  char cSSID[g_nwSSID.length()+1], cPASS[g_nwPASS.length()+1], cMQTT[g_nwMQTT.length()+1];
-  g_nwSSID.toCharArray(cSSID, g_nwSSID.length()+1);    
-  g_nwPASS.toCharArray(cPASS, g_nwPASS.length()+1);    
-  g_nwMQTT.toCharArray(cMQTT, g_nwMQTT.length()+1);
-  /*Serial.println(" save new SSID,PASS,MQTT ");
+  char cSSID[g_nwSSID.length()], cPASS[g_nwPASS.length()], cMQTT[g_nwMQTT.length()];
+  g_nwSSID.toCharArray(cSSID, g_nwSSID.length());    
+  g_nwPASS.toCharArray(cPASS, g_nwPASS.length());    
+  g_nwMQTT.toCharArray(cMQTT, g_nwMQTT.length());
+  Serial.println("Saving new SSID,PASS,MQTT ");
   Serial.print  (cSSID);
   Serial.print  (cPASS);
   Serial.println(cMQTT);
   Serial.print  (g_nwSSID);
   Serial.print  (g_nwPASS);
   Serial.println(g_nwMQTT);
-  */
+  
   StaticJsonBuffer<200> jsonBuffer;
   JsonObject& json = jsonBuffer.createObject();
   json["ssid"] = cSSID;
@@ -163,33 +179,7 @@ bool saveConfig() {
   return true;
 }
 
-/*
-void printState(relayctl& myData)
-{
-  Serial.print("Plug 1: ");
-  Serial.print(myData.sched1);
-  Serial.print("min, during ");
-  Serial.print(myData.maxdur1);
-  Serial.print("s(currently ");
-  Serial.print(myData.state1);
-  Serial.print(")\nPlug 2: ");
-  Serial.print(myData.sched2);
-  Serial.print("min, during ");
-  Serial.print(myData.maxdur2);
-  Serial.print("s(currently ");
-  Serial.print(myData.state2);
-  Serial.print(")\nTemperature: ");
-  Serial.print(myData.temp_now);
-  Serial.print("/");
-  Serial.print(myData.temp_thres);
-  Serial.print("\nUptime: ");
-  Serial.print(myData.uptime);
-  Serial.print("min\nBattery:");
-  Serial.print(myData.battery);
-  Serial.print("V\nWaterLow:");
-  Serial.print(myData.waterlow);
-  Serial.println();   
-}
+
 
 void setup_wifi() {
 
@@ -198,11 +188,9 @@ void setup_wifi() {
     // Connect to WiFi network
     Serial.println(F("Connecting"));
     
+    
     WiFi.mode(WIFI_STA);
-    char cSSID[g_nwSSID.length()+1], cPASS[g_nwPASS.length()+1];
-    g_nwSSID.toCharArray(cSSID, g_nwSSID.length()+1);    
-    g_nwPASS.toCharArray(cPASS, g_nwPASS.length()+1);
-    WiFi.begin(cSSID, cPASS);
+    WiFi.begin(mySSID, myPASSWORD);
 
     int timeout = 90;
     while (WiFi.status() != WL_CONNECTED) 
@@ -214,7 +202,7 @@ void setup_wifi() {
         Serial.print("Failed to connect to WiFi nw. Status is now ");
         Serial.println(WiFi.status());
         WiFi.printDiag(Serial);
-        WiFi.begin("HNet", ".ht2727rc.PRO!");
+        WiFi.begin(mySSID2, myPASSWORD2);
       }
       if (timeout == 30) // a basic connect timeout sorta thingy
       {
@@ -222,7 +210,7 @@ void setup_wifi() {
         Serial.print("Failed to connect to WiFi nw. Status is now ");
         Serial.println(WiFi.status());
         WiFi.printDiag(Serial);
-        WiFi.begin("Alabara", "Stach=fu1");
+        WiFi.begin(mySSID3, myPASSWORD3);
       }
       if (--timeout < 1) // a basic connect timeout sorta thingy
       {
@@ -238,7 +226,7 @@ void setup_wifi() {
   WiFi.printDiag(Serial);
   Serial.println(WiFi.localIP());  
 }
-*/
+
 void setup_spiffs()
 {
   uint32_t realSize = ESP.getFlashChipRealSize();
@@ -287,28 +275,20 @@ void setup()
   delay(500);
   Serial.println(F("- - - - -"));  
   
-/*  pinMode(HW_RELAY1, OUTPUT);
-  pinMode(HW_RELAY2, OUTPUT);
-  digitalWrite(HW_RELAY1, HIGH);
-  digitalWrite(HW_RELAY2, HIGH);
-  pinMode(HW_WATE, INPUT_PULLUP);
-  pinMode(HW_BUZZ, OUTPUT);
-  pinMode(HW_BATT, INPUT);
-  pinMode(HW_TEMP, INPUT);*/
   
   //prepare and configure SPIFFS
   setup_spiffs();
   
   // setting up WLAN related stuff 
-  //setup_wifi();
+  setup_wifi();
 
-/*  char cMQTTserver[g_nwMQTT.length()+1];
+  char cMQTTserver[g_nwMQTT.length()+1];
   g_nwMQTT.toCharArray(cMQTTserver, g_nwMQTT.length()+1);
   client.setServer(cMQTTserver, 1880);
-  client.setCallback(callback);*/
+  client.setCallback(callback);
 }
 
-/*
+
 void callback(char* topic, byte* payload, unsigned int length) {
   Serial.print("Message arrived [");
   Serial.print(topic);
@@ -334,6 +314,16 @@ void callback(char* topic, byte* payload, unsigned int length) {
   if (sTopic.indexOf(T_SWITCH2)>=0) 
   {
     myData.state2 = ((char)payload[0] == '1')?true:false;
+//    digitalWrite(HW_RELAY2, myData.state2);   
+  }
+  if (sTopic.indexOf(T_SWITCH3)>=0) 
+  {
+    myData.state3 = ((char)payload[0] == '1')?true:false;
+//    digitalWrite(HW_RELAY1, myData.state1);   
+  }
+  if (sTopic.indexOf(T_SWITCH4)>=0) 
+  {
+    myData.state4 = ((char)payload[0] == '1')?true:false;
 //    digitalWrite(HW_RELAY2, myData.state2);   
   }
   if (sTopic.indexOf(T_TEMP)>=0) 
@@ -369,10 +359,10 @@ void callback(char* topic, byte* payload, unsigned int length) {
     String sB2 = String(myData.state2);
     String sWL = String(myData.waterlow);
     String sStatus("Uptime:"+sUp+" Schedule1:"+sS1+" Schedul2:"+sS2+" Duration1:"+sD1+" Duration2:"+sD2+" Temperature:"+sT1+"/"+sT2+" WaterLow:"+sWL);
-    //char qS[sStatus.length()] ;
-    //sStatus.toCharArray(qS, sStatus.length());
+    char qS[sStatus.length()] ;
+    sStatus.toCharArray(qS, sStatus.length());
     Serial.println(sStatus);
-    //client.publish(MOD CAT T_CURSTATUS, (uint8_t*)qS, sStatus.length());
+    client.publish(MOD CAT T_CURSTATUS, (uint8_t*)qS, sStatus.length());
   }
 }
 
@@ -387,7 +377,8 @@ void reconnect() {
     }
     Serial.print("Connect to MQTT broker... "); 
     // Attempt to connect
-    if (client.connect("ESP8266Client")) {
+    if (client.connect("ESP8266Client")) 
+    {
       Serial.println("connected");
       // Once connected, publish an announcement...
       client.publish("outTopic", "hello world");
@@ -395,12 +386,19 @@ void reconnect() {
       client.subscribe(MOD CAT T_COMMAND, 1);
       client.subscribe(MOD CAT T_SWITCH1, 1);
       client.subscribe(MOD CAT T_SWITCH2, 1);
+      client.subscribe(MOD CAT T_SWITCH3, 1);
+      client.subscribe(MOD CAT T_SWITCH4, 1);
       client.subscribe(MOD CAT T_DURATION1, 1);
       client.subscribe(MOD CAT T_DURATION2, 1);
+      client.subscribe(MOD CAT T_DURATION3, 1);
+      client.subscribe(MOD CAT T_DURATION4, 1);
       client.subscribe(MOD CAT T_SCHEDULE1, 1);
       client.subscribe(MOD CAT T_SCHEDULE2, 1);
+      client.subscribe(MOD CAT T_SCHEDULE3, 1);
+      client.subscribe(MOD CAT T_SCHEDULE4, 1);
       client.subscribe(MOD CAT T_TEMP, 1);
-    } else {
+    } else 
+    {
       Serial.print("failed, rc=");
       Serial.print(client.state());
       Serial.println(" try again in 5 seconds");
@@ -409,11 +407,11 @@ void reconnect() {
     }
   }
 }
-*/
+
 
 void loop() 
 {
-/*
+
   if (!client.connected()) 
   {
     reconnect();
@@ -431,42 +429,6 @@ void loop()
       client.publish("outTopic", msg);
     }
   }
-*/
-  
-  // is it cold enough to turn justify heating the engine...
-  //if ( readTemperature() < myData.temp_thres )
-  {
-    if ( millis()/60000 >= myData.sched1  && myData.sched1 > 0  )
-    {
-      myData.state1 = true;
-    }
-    if ( millis()/60000 >= myData.sched2  && myData.sched2 > 0  )
-    {
-      myData.state2 = true;
-    }
-  }
-    
-  // switch relays off after max_duration
-  if ( myData.sched1 > 0 && (millis()/1000) > (myData.sched1*60)+myData.maxdur1 )
-  { 
-    myData.state1 = false;
-    //automatically schedule relay1 to tomorrow
-    myData.sched1 += (unsigned long)24*(unsigned long)60; 
-  }
-  if ( myData.sched2 > 0 && (millis()/1000) > (myData.sched2*60)+myData.maxdur2 )
-  { 
-    myData.state2 = false;
-    //automatically schedule relay2 to tomorrow
-    myData.sched2 += (unsigned long)24*(unsigned long)60; 
-  }
-//  digitalWrite(HW_RELAY1, !myData.state1); // relays are npn-transistorized so have to reverse the logic
-//  digitalWrite(HW_RELAY2, !myData.state2); // of my program to de/activate each channel
-
-
-
-
-
-
 
   /* 
    *  Because I dunno how I will eventually need to debug this thing,
