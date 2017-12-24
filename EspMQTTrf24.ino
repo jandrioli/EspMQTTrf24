@@ -26,7 +26,7 @@
 #include "FS.h"
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
-
+#include <RF24.h>
 // Update these with values suitable for your network.
 
 #define useCredentialsFile
@@ -43,14 +43,20 @@ myPASSWORD = "   ";
 #define T_SWITCH2          "switch2"
 #define T_SWITCH3          "switch3"
 #define T_SWITCH4          "switch4"
-#define T_SCHEDULE1        "schedule1"
-#define T_SCHEDULE2        "schedule2"
-#define T_DURATION1        "duration1"
-#define T_DURATION2        "duration2"
-#define T_TEMP             "temperatureThreshold"
+#define T_SCHEDULE1        "sched1"
+#define T_SCHEDULE2        "sched2"
+#define T_SCHEDULE3        "sched3"
+#define T_SCHEDULE4        "sched4"
+#define T_DURATION1        "dur1"
+#define T_DURATION2        "dur2"
+#define T_DURATION3        "dur3"
+#define T_DURATION4        "dur4"
+#define T_TEMP             "temp"
 #define T_COMMAND          "provideStatus"
 #define T_CURSTATUS        "currentStatus"
 
+#define HW_CSN   15        // icsp
+#define HW_CE    2        // icsp
 // 
 // SW Logic and firmware definitions
 // 
@@ -58,12 +64,21 @@ myPASSWORD = "   ";
 #define DEFAULT_ACTIVATION 600          // 10h from now we activate (in case radio is down and can't program)
 #define DEFAULT_DURATION 10             // max 10s of activation time by default
 
+WiFiClient espClient;
+PubSubClient client(espClient);
+String g_nwSSID = "", g_nwPASS = "", g_nwMQTT = "192.168.8.1";
+long lastMsg = 0;
+char msg[50];
+int value = 0;
+
+RF24 radio(HW_CE, HW_CSN);
+
 /**
  * exchange data via radio more efficiently with data structures.
  * we can exchange max 32 bytes of data per msg. 
  * schedules are reset every 24h (last for a day) so an INTEGER is
  * large enough to store the maximal value of a 24h-schedule.
- * temperature threshold is rarely used
+ * temperature threshold is rarely used 
  */
 struct relayctl {
   unsigned long uptime = 0;                      // current running time of the machine (millis())  4 bytes  
@@ -86,15 +101,41 @@ struct relayctl {
   byte          nodeid = 3;           // nodeid is the identifier of the slave           1 byte
 } myData;
 
-WiFiClient espClient;
-PubSubClient client(espClient);
-String g_nwSSID = "", g_nwPASS = "", g_nwMQTT = "192.168.8.1";
-long lastMsg = 0;
-char msg[50];
-int value = 0;
 
+// Radio pipe addresses for the nodes to communicate.
+// WARNING!! 3Node and 4Node are used by my testing sketches ping/pong
+const uint8_t addresses[][6] = {
+  "0Node", // master writes broadcasts here
+  "1Node", // unor3 writes here
+  "2Node", // unor3 reads here
+  "3Node", // arrosoir reads here
+  "4Node", // arrosoir writes here
+  "5Node"};// not yet used by anybody
+
+void setupRadio()
+{
+  radio.begin();
+  radio.setCRCLength( RF24_CRC_16 ) ;
+  radio.setRetries( 15, 15 ) ;
+  radio.setAutoAck( true ) ;
+  radio.setPALevel( RF24_PA_MAX ) ;
+  radio.setDataRate( RF24_250KBPS ) ;
+  radio.setChannel( 108 ) ;
+  radio.enableDynamicPayloads(); 
+  
+  radio.openWritingPipe(addresses[5]);
+  radio.openReadingPipe(1,addresses[1]);
+  radio.openReadingPipe(2,addresses[4]);
+  Serial.println(F("Radio setup:"));  
+  radio.printDetails();
+  Serial.println(F("- - - - -"));  
+  radio.powerUp();
+  radio.write( &myData, sizeof(myData) ); 
+  radio.startListening();
+}
 
 bool loadConfig() {
+  Serial.println("Loading configuration...");
   File configFile = SPIFFS.open("/config.json", "r");
   if (!configFile) {
     Serial.println("Failed to open config file");
@@ -126,12 +167,9 @@ bool loadConfig() {
   const char* nwSSID = json["ssid"];
   const char* nwPASS = json["pass"];
   const char* nwMQTT = json["mqtt"];
-  /*Serial.println((nwSSID));  
+  Serial.println((nwSSID));  
   Serial.println((nwPASS));
-  Serial.println((nwMQTT));*/
-
-  // Real world application would store these values in some variables for
-  // later use.
+  Serial.println((nwMQTT));
 
   g_nwSSID = String(nwSSID);
   g_nwPASS = String(nwPASS);
@@ -149,19 +187,22 @@ bool loadConfig() {
   return true;
 }
 
-bool saveConfig() {
-  
-  char cSSID[g_nwSSID.length()], cPASS[g_nwPASS.length()], cMQTT[g_nwMQTT.length()];
-  g_nwSSID.toCharArray(cSSID, g_nwSSID.length());    
-  g_nwPASS.toCharArray(cPASS, g_nwPASS.length());    
-  g_nwMQTT.toCharArray(cMQTT, g_nwMQTT.length());
-  Serial.println("Saving new SSID,PASS,MQTT ");
-  Serial.print  (cSSID);
-  Serial.print  (cPASS);
-  Serial.println(cMQTT);
-  Serial.print  (g_nwSSID);
-  Serial.print  (g_nwPASS);
-  Serial.println(g_nwMQTT);
+bool saveConfig() 
+{
+  Serial.println("Saving configuration into spiffs...");
+  char cSSID[g_nwSSID.length()+1], cPASS[g_nwPASS.length()+1], cMQTT[g_nwMQTT.length()+1];
+  g_nwSSID.toCharArray(cSSID, g_nwSSID.length()+1);    
+  g_nwPASS.toCharArray(cPASS, g_nwPASS.length()+1);    
+  g_nwMQTT.toCharArray(cMQTT, g_nwMQTT.length()+1);
+  Serial.print("Saving new SSID:[");
+  Serial.print(cSSID);
+  Serial.println(']');
+  Serial.print("Saving new PASS:[");
+  Serial.print(cPASS);
+  Serial.println(']');
+  Serial.print("Saving new MQTT:[");
+  Serial.print(cMQTT);
+  Serial.println(']');
   
   StaticJsonBuffer<200> jsonBuffer;
   JsonObject& json = jsonBuffer.createObject();
@@ -174,57 +215,57 @@ bool saveConfig() {
     Serial.println("Failed to open config file for writing");
     return false;
   }
-
   json.printTo(configFile);
   return true;
 }
 
 
 
-void setup_wifi() {
-
+void setup_wifi() 
+{
   delay(10);
 
-    // Connect to WiFi network
-    Serial.println(F("Connecting"));
+  // Connect to WiFi network
+  Serial.println(F("Connecting"));
     
     
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(mySSID, myPASSWORD);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(mySSID, myPASSWORD);
 
-    int timeout = 90;
-    while (WiFi.status() != WL_CONNECTED) 
+  int timeout = 90;
+  while (WiFi.status() != WL_CONNECTED) 
+  {
+    Serial.print(".");
+    if (timeout == 60) // a basic connect timeout sorta thingy
     {
-      Serial.print(".");
-      if (timeout == 60) // a basic connect timeout sorta thingy
-      {
-        Serial.println();
-        Serial.print("Failed to connect to WiFi nw. Status is now ");
-        Serial.println(WiFi.status());
-        WiFi.printDiag(Serial);
-        WiFi.begin(mySSID2, myPASSWORD2);
-      }
-      if (timeout == 30) // a basic connect timeout sorta thingy
-      {
-        Serial.println();
-        Serial.print("Failed to connect to WiFi nw. Status is now ");
-        Serial.println(WiFi.status());
-        WiFi.printDiag(Serial);
-        WiFi.begin(mySSID3, myPASSWORD3);
-      }
-      if (--timeout < 1) // a basic connect timeout sorta thingy
-      {
-        break;
-      }
-      delay(1000);
+      Serial.println();
+      Serial.print("Failed to connect to WiFi nw. Status is now ");
+      Serial.println(WiFi.status());
+      WiFi.printDiag(Serial);
+      Serial.println(F("Connecting2"));
+      WiFi.begin(mySSID2, myPASSWORD2);
     }
+    if (timeout == 30) // a basic connect timeout sorta thingy
+    {
+      Serial.println();
+      Serial.print("Failed to connect to WiFi nw. Status is now ");
+      Serial.println(WiFi.status());
+      WiFi.printDiag(Serial);
+      Serial.println(F("Connecting3"));
+      WiFi.begin(mySSID3, myPASSWORD3);
+    }
+    if (--timeout < 1) // a basic connect timeout sorta thingy
+    {
+      break;
+    }
+    delay(1000);
+  }
   
-
   Serial.println(F(""));
   Serial.println(F("WiFi connected"));
-  Serial.println(F("IP address: "));
-  WiFi.printDiag(Serial);
+  Serial.print(F("IP address: "));
   Serial.println(WiFi.localIP());  
+  WiFi.printDiag(Serial);
 }
 
 void setup_spiffs()
@@ -262,6 +303,7 @@ void setup_spiffs()
 
 void setup() 
 {
+  delay(500);
   //
   // Print preamble
   //
@@ -281,11 +323,14 @@ void setup()
   
   // setting up WLAN related stuff 
   setup_wifi();
-
+  yield();
   char cMQTTserver[g_nwMQTT.length()+1];
   g_nwMQTT.toCharArray(cMQTTserver, g_nwMQTT.length()+1);
-  client.setServer(cMQTTserver, 1880);
+  client.setServer(cMQTTserver, 1883);
   client.setCallback(callback);
+
+  // rf24 init
+  setupRadio();
 }
 
 
@@ -362,7 +407,8 @@ void callback(char* topic, byte* payload, unsigned int length) {
     char qS[sStatus.length()] ;
     sStatus.toCharArray(qS, sStatus.length());
     Serial.println(sStatus);
-    client.publish(MOD CAT T_CURSTATUS, (uint8_t*)qS, sStatus.length());
+    client.publish(MOD CAT T_CURSTATUS, (uint8_t*)&myData, sizeof(myData));
+    //client.publish(MOD CAT T_CURSTATUS, (uint8_t*)qS, sStatus.length());
   }
 }
 
@@ -383,27 +429,29 @@ void reconnect() {
       // Once connected, publish an announcement...
       client.publish("outTopic", "hello world");
       // ... and resubscribe
-      client.subscribe(MOD CAT T_COMMAND, 1);
-      client.subscribe(MOD CAT T_SWITCH1, 1);
-      client.subscribe(MOD CAT T_SWITCH2, 1);
-      client.subscribe(MOD CAT T_SWITCH3, 1);
-      client.subscribe(MOD CAT T_SWITCH4, 1);
-      client.subscribe(MOD CAT T_DURATION1, 1);
-      client.subscribe(MOD CAT T_DURATION2, 1);
-      client.subscribe(MOD CAT T_DURATION3, 1);
-      client.subscribe(MOD CAT T_DURATION4, 1);
-      client.subscribe(MOD CAT T_SCHEDULE1, 1);
-      client.subscribe(MOD CAT T_SCHEDULE2, 1);
-      client.subscribe(MOD CAT T_SCHEDULE3, 1);
-      client.subscribe(MOD CAT T_SCHEDULE4, 1);
-      client.subscribe(MOD CAT T_TEMP, 1);
-    } else 
+      if (!client.subscribe(MOD CAT T_COMMAND)) Serial.println("KO "  T_COMMAND); 
+      if (!client.subscribe(MOD CAT T_SWITCH1)) Serial.println("KO "  T_SWITCH1); 
+      if (!client.subscribe(MOD CAT T_SWITCH2)) Serial.println("KO "  T_SWITCH2); 
+      if (!client.subscribe(MOD CAT T_SWITCH3) )Serial.println("KO "  T_SWITCH3); 
+      if (!client.subscribe(MOD CAT T_SWITCH4) )Serial.println("KO "  T_SWITCH4); /*
+      if (!client.subscribe(MOD CAT T_TEMP)    )Serial.println("KO "  T_TEMP); 
+      if (!client.subscribe(MOD CAT T_DURATION1)) Serial.println("KO "  T_DURATION1); 
+      if (!client.subscribe(MOD CAT T_DURATION2)) Serial.println("KO "  T_DURATION2); 
+      if (!client.subscribe(MOD CAT T_DURATION3)) Serial.println("KO "  T_DURATION3); 
+      if (!client.subscribe(MOD CAT T_DURATION4)) Serial.println("KO "  T_DURATION4); 
+      if (!client.subscribe(MOD CAT T_SCHEDULE1)) Serial.println("KO "  T_SCHEDULE1); 
+      if (!client.subscribe(MOD CAT T_SCHEDULE2)) Serial.println("KO "  T_SCHEDULE2); 
+      if (!client.subscribe(MOD CAT T_SCHEDULE3)) Serial.println("KO "  T_SCHEDULE3); 
+      if (!client.subscribe(MOD CAT T_SCHEDULE4)) Serial.println("KO "  T_SCHEDULE4);*/ 
+      Serial.println("subscribed");
+    } 
+    else 
     {
       Serial.print("failed, rc=");
       Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(2000);
+      Serial.println(" try again in 1 seconds");
+      // Wait 1 seconds before retrying
+      delay(1000);
     }
   }
 }
@@ -411,7 +459,6 @@ void reconnect() {
 
 void loop() 
 {
-
   if (!client.connected()) 
   {
     reconnect();
@@ -419,6 +466,7 @@ void loop()
   if (client.connected()) 
   {
     client.loop();
+    
     long now = millis();
     if (now - lastMsg > 10000) {
       lastMsg = now;
@@ -436,7 +484,7 @@ void loop()
    */
   while (Serial.available())
   {
-    String s1 = Serial.readStringUntil('\n');
+    String s1 = Serial.readString();//readStringUntil('\n');
     Serial.println(F("CAREFUL, end of line is only NL and no CR!!!"));
     Serial.print("You typed:");
     Serial.println(s1);
@@ -456,9 +504,17 @@ void loop()
     {
       s1 = s1.substring(s1.indexOf(" ")+1);
       g_nwMQTT = s1.substring(0, s1.length());
+      
+      char cSSID[g_nwSSID.length()+1], cPASS[g_nwPASS.length()+1], cMQTT[g_nwMQTT.length()+1];
+      g_nwSSID.toCharArray(cSSID, g_nwSSID.length()+1);    
+      g_nwPASS.toCharArray(cPASS, g_nwPASS.length()+1);    
+      g_nwMQTT.toCharArray(cMQTT, g_nwMQTT.length()+1);
+      
+      client.setServer(cMQTT, 1883);
+      
       Serial.println(("new mqtt is now [" + g_nwMQTT + "]"));
     }
-    else if (s1.indexOf("setnewcfg")>=0)
+    else if (s1.indexOf("save")>=0)
     {
       saveConfig();
     }
